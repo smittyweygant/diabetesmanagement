@@ -1,0 +1,41 @@
+# Cloned upstream repositories (managed by setup.sh)
+cgm-remote-monitor/
+tconnectsync/
+
+# Environment files with secrets (use .env.template files as reference)
+*.env
+!*.env.template
+
+# MongoDB data directory
+mongo-data/
+
+# Let's Encrypt certificates
+letsencrypt/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# Node.js
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Backup files (local copies before upload)
+backups/

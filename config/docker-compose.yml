@@ -1,0 +1,92 @@
+# Docker Compose for Nightscout + MongoDB
+# 
+# Usage:
+#   1. Copy nightscout.env.template to nightscout.env and configure
+#   2. Run: docker compose up -d
+#   3. Access Nightscout at http://localhost:1337 (or via Traefik on 443)
+#
+# For production with SSL, update the Traefik labels below.
+
+version: '3.8'
+
+x-logging: &default-logging
+  options:
+    max-size: '10m'
+    max-file: '5'
+  driver: json-file
+
+services:
+  # ==========================================================================
+  # MongoDB Database
+  # ==========================================================================
+  mongo:
+    image: mongo:4.4
+    container_name: nightscout-mongo
+    restart: unless-stopped
+    volumes:
+      - ${MONGO_DATA_DIR:-../mongo-data}:/data/db:cached
+    logging: *default-logging
+    # Uncomment to expose MongoDB port for external access/backup
+    # ports:
+    #   - "27017:27017"
+
+  # ==========================================================================
+  # Nightscout Application
+  # ==========================================================================
+  nightscout:
+    image: nightscout/cgm-remote-monitor:latest
+    container_name: nightscout
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    env_file:
+      - ./nightscout.env
+    environment:
+      # Override for Docker networking
+      MONGO_CONNECTION: mongodb://mongo:27017/nightscout
+      NODE_ENV: production
+    ports:
+      # Direct access without Traefik (for local/testing)
+      - "1337:1337"
+    labels:
+      # Traefik labels for production SSL (uncomment and configure)
+      - 'traefik.enable=true'
+      - 'traefik.http.routers.nightscout.rule=Host(`nightscout.example.com`)'
+      - 'traefik.http.routers.nightscout.entrypoints=websecure'
+      - 'traefik.http.routers.nightscout.tls.certresolver=le'
+      - 'traefik.http.services.nightscout.loadbalancer.server.port=1337'
+    logging: *default-logging
+
+  # ==========================================================================
+  # Traefik Reverse Proxy (for SSL/HTTPS)
+  # Uncomment this section for production with automatic Let's Encrypt certs
+  # ==========================================================================
+  # traefik:
+  #   image: traefik:latest
+  #   container_name: traefik
+  #   restart: unless-stopped
+  #   command:
+  #     - '--providers.docker=true'
+  #     - '--providers.docker.exposedbydefault=false'
+  #     - '--entrypoints.web.address=:80'
+  #     - '--entrypoints.web.http.redirections.entrypoint.to=websecure'
+  #     - '--entrypoints.websecure.address=:443'
+  #     - '--certificatesresolvers.le.acme.httpchallenge=true'
+  #     - '--certificatesresolvers.le.acme.httpchallenge.entrypoint=web'
+  #     - '--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json'
+  #     # UPDATE: Your email for Let's Encrypt notifications
+  #     - '--certificatesresolvers.le.acme.email=your-email@example.com'
+  #   ports:
+  #     - '80:80'
+  #     - '443:443'
+  #   volumes:
+  #     - '../letsencrypt:/letsencrypt'
+  #     - '/var/run/docker.sock:/var/run/docker.sock:ro'
+  #   logging: *default-logging
+
+# ==========================================================================
+# Networks (optional, for isolation)
+# ==========================================================================
+networks:
+  default:
+    name: nightscout-network

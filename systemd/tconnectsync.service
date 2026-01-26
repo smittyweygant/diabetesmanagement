@@ -1,0 +1,65 @@
+# Tconnectsync Systemd Service
+#
+# This service runs tconnectsync in auto-update mode to continuously
+# sync data from Tandem Source to Nightscout.
+#
+# Installation:
+#   sudo cp tconnectsync.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable tconnectsync
+#   sudo systemctl start tconnectsync
+#
+# Management:
+#   sudo systemctl status tconnectsync
+#   sudo systemctl stop tconnectsync
+#   sudo systemctl restart tconnectsync
+#   journalctl -u tconnectsync -f
+#
+
+[Unit]
+Description=Tconnectsync - Tandem Source to Nightscout Sync
+Documentation=https://github.com/jwoglom/tconnectsync
+After=network-online.target nightscout.service
+Wants=network-online.target
+# Optional: wait for Nightscout to be ready
+# Wants=nightscout.service
+
+[Service]
+Type=simple
+
+# UPDATE: Set the user to run as
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+
+# UPDATE: Set the path to your diabetes repo
+WorkingDirectory=/home/YOUR_USERNAME/diabetes
+
+# Load environment from file
+EnvironmentFile=/home/YOUR_USERNAME/diabetes/config/tconnectsync.env
+
+# Run tconnectsync in auto-update mode
+# If installed via pip --user, the binary is in ~/.local/bin/
+ExecStart=/usr/bin/env tconnectsync --auto-update
+
+# Alternative if installed to user directory:
+# ExecStart=/home/YOUR_USERNAME/.local/bin/tconnectsync --auto-update
+
+# Restart on failure
+Restart=always
+RestartSec=60
+
+# Give it time to gracefully shutdown
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening (optional)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/YOUR_USERNAME/diabetes
+
+[Install]
+WantedBy=multi-user.target
