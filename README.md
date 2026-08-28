@@ -1,298 +1,257 @@
 # Smitty's CGM Data Management
 
-I use Nightscout, Tconnectsync, and MongoDB to capture and track my diabetes health. I currently use a Dexcom G7 and Tandem Mobi in a closed loop to manage my insulin delivery.
+Self-hosted [Nightscout](https://github.com/nightscout/cgm-remote-monitor) +
+[tconnectsync](https://github.com/jwoglom/tconnectsync) + MongoDB for a Dexcom G7 /
+Tandem Mobi closed loop.
 
-## Software and Services
+- **Real-time CGM:** Dexcom G7 → Dexcom Share → Nightscout's `connect` plugin.
+- **Pump data:** Tandem Mobi → Tandem Source → tconnectsync → Nightscout
+  (basal, bolus, pump events, profiles, plus a lagged backup copy of pump CGM).
+- **Host:** a Beelink mini PC on the home LAN.
+- **Remote access:** Tailscale only — no public ports, no domain, no Let's Encrypt.
+- **Secrets:** encrypted at rest with SOPS + age; decrypted to RAM (tmpfs) at service
+  start. Nothing sensitive on disk except the age key.
 
-### [Nightscout](https://github.com/nightscout/cgm-remote-monitor)
+> Migrated off an AWS EC2 box in 2026. The old stack died when Tandem retired t:connect
+> for **Tandem Source** (Sept 2024) — anything below tconnectsync 2.0 stopped working.
+> Historical data was not carried over; this starts from an empty database.
 
-Nightscout is an OSS project for individuals building their own closed loop diabetes management systems - it has sync capability to many common device and health system providers. It maintains a database of Continuous Glucose Monitoring data.
-
-### [Tconnectsync](https://github.com/jwoglom/tconnectsync)
-
-The Nightscout project does not have a native sync to Tandem Source. Tconnectsync provides the ability to pull Tandem t.Slim and Mobi pump configuration and event data.
-
-### MongoDB
-
-MongoDB is the data store for Nightscout.
-
-## Repository Structure
+## Repository layout
 
 ```
 diabetes/
-├── README.md                         # This file
-├── .gitignore                        # Ignores cloned repos and secrets
-├── setup.sh                          # Main installation script
+├── setup.sh                        # bootstrap check + scaffolding (installs nothing)
 ├── config/
-│   ├── nightscout.env.template       # Nightscout configuration template
-│   ├── tconnectsync.env.template     # Tconnectsync configuration template
-│   ├── backup.env.template           # Backup script configuration template
-│   └── docker-compose.yml            # Docker Compose for Nightscout + MongoDB
+│   ├── docker-compose.yml          # the whole stack: mongo + nightscout + tconnectsync
+│   ├── .env.template               # non-secret compose vars (paths) -> copy to config/.env
+│   ├── nightscout.env.template     # reference: every Nightscout var documented
+│   ├── tconnectsync.env.template   # reference: every tconnectsync var documented
+│   └── backup.env.template         # reference: backup / S3 vars
+├── secrets/
+│   ├── README.md                   # how the SOPS+age flow works - READ THIS
+│   ├── *.env.example               # plaintext placeholders to seed the encrypted files
+│   └── *.env.sops.yaml             # ENCRYPTED real config (committed; created on the host)
 ├── scripts/
-│   ├── backup-mongodb.sh             # MongoDB backup to S3
-│   └── restore-mongodb.sh            # Restore from S3 backup
-├── systemd/                          # Systemd service files (optional)
-│   ├── nightscout.service
-│   └── tconnectsync.service
-├── cgm-remote-monitor/               # Cloned by setup.sh (gitignored)
-└── tconnectsync/                     # Cloned by setup.sh (gitignored)
+│   ├── secrets.sh                  # sops wrapper: edit / decrypt-all / rekey
+│   ├── backup-mongodb.sh           # mongodump (--docker), optional S3 upload
+│   └── restore-mongodb.sh          # mongorestore from local file or S3
+└── systemd/
+    └── diabetes-stack.service      # decrypt secrets -> compose up -> shred on stop
 ```
 
-## Quick Start
+## How it fits together
 
-### Prerequisites
-
-- Docker and Docker Compose
-- Python 3 with pip
-- Git
-- AWS CLI (optional, for S3 backups)
-
-### Installation
-
-1. **Clone this repository:**
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/diabetes.git
-   cd diabetes
-   ```
-
-2. **Run the setup script:**
-   ```bash
-   ./setup.sh
-   ```
-
-3. **Configure your environment files:**
-   ```bash
-   # Edit Nightscout settings
-   nano config/nightscout.env
-   
-   # Edit Tconnectsync credentials
-   nano config/tconnectsync.env
-   ```
-
-4. **Start Nightscout:**
-   ```bash
-   cd config
-   docker compose up -d
-   ```
-
-5. **Verify Nightscout is running:**
-   ```bash
-   # Check container status
-   docker compose ps
-   
-   # View logs
-   docker compose logs -f nightscout
-   ```
-   
-   Access Nightscout at http://localhost:1337
-
-## Configuration
-
-### Nightscout (`config/nightscout.env`)
-
-Key settings to configure:
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `API_SECRET` | Authentication secret (min 12 chars) | `my_secure_secret_123` |
-| `DISPLAY_UNITS` | BG display units | `mg/dl` or `mmol/L` |
-| `TZ` | Timezone | `America/New_York` |
-| `ENABLE` | Enabled plugins | `careportal rawbg iob cob` |
-| `AUTH_DEFAULT_ROLES` | Default access level | `denied` (requires auth) |
-
-See `config/nightscout.env.template` for all available options.
-
-### Tconnectsync (`config/tconnectsync.env`)
-
-| Variable | Description |
-|----------|-------------|
-| `TCONNECT_EMAIL` | Your Tandem Source email |
-| `TCONNECT_PASSWORD` | Your Tandem Source password |
-| `NS_URL` | Your Nightscout URL |
-| `NS_SECRET` | Nightscout API secret (must match `API_SECRET`) |
-| `TIMEZONE_NAME` | Your pump's timezone |
-
-### Running Tconnectsync
-
-**Option 1: Manual run**
-```bash
-# Load environment and run once
-set -a && source config/tconnectsync.env && set +a
-tconnectsync
+```
+Dexcom G7 app ──Share──► Nightscout `connect` plugin ─┐
+                                                      ├─► MongoDB ─► Nightscout web UI
+Tandem Mobi ─► Tandem Source ─► tconnectsync ─────────┘         (bound to 127.0.0.1:1337)
+                                                                      │
+                                              Tailscale Serve (HTTPS on the tailnet)
+                                                                      │
+                                          phone / laptop / Home Assistant (Airstream)
 ```
 
-**Option 2: Auto-update mode (continuous sync)**
+`systemd/diabetes-stack.service` runs at boot: it `sops --decrypt`s
+`secrets/*.env.sops.yaml` into `/run/diabetes/` (tmpfs), runs `docker compose up -d`,
+and `shred`s the plaintext on stop. `restart: unless-stopped` keeps the containers up
+between reboots.
+
+---
+
+## Beelink setup
+
+Assumes fresh **Ubuntu Server 24.04 LTS**, wired ethernet. Run as a normal sudo user.
+
+### 1. Base OS
+
 ```bash
-set -a && source config/tconnectsync.env && set +a
-tconnectsync --auto-update
+sudo apt update && sudo apt full-upgrade -y && sudo reboot
+sudo timedatectl set-timezone America/Denver        # your home-base tz
+sudo timedatectl set-ntp true
+sudo apt install -y unattended-upgrades apt-listchanges age
+sudo dpkg-reconfigure -plow unattended-upgrades
 ```
 
-**Option 3: Using systemd (recommended for production)**
+### 2. Docker
+
 ```bash
-sudo cp systemd/tconnectsync.service /etc/systemd/system/
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker "$USER"        # then log out / back in
+sudo systemctl enable --now docker
+docker compose version                 # must be v2.x
+```
+
+### 3. SOPS
+
+```bash
+SOPS_VER=3.9.0
+curl -fsSLo /tmp/sops https://github.com/getsops/sops/releases/download/v${SOPS_VER}/sops-v${SOPS_VER}.linux.amd64
+sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+```
+
+### 4. Tailscale
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --ssh --hostname beelink-ns
+tailscale ip -4
+```
+
+In the Tailscale **admin console** for node `beelink-ns`:
+- **Disable key expiry** — otherwise the box silently drops off the tailnet in ~180 days.
+- Enable **MagicDNS** + **HTTPS certificates**.
+
+MagicDNS name will be `beelink-ns.<your-tailnet>.ts.net`.
+
+### 5. Clone + scaffold
+
+```bash
+sudo mkdir -p /opt/diabetes && sudo chown "$USER":"$USER" /opt/diabetes
+git clone git@github.com:smittyweygant/diabetesmanagement.git /opt/diabetes
+cd /opt/diabetes
+./setup.sh
+$EDITOR config/.env                     # set MONGO_DATA_DIR / TCONNECTSYNC_DATA_DIR to /opt/diabetes/data/...
+sudo chown -R 999:999 /opt/diabetes/data/mongo   # mongo container runs as uid 999
+```
+
+### 6. Secrets
+
+Follow **[`secrets/README.md`](secrets/README.md)** to:
+1. `age-keygen` the host key (and copy it into your password manager).
+2. Put the age **public** key into `.sops.yaml`.
+3. Create `secrets/nightscout.env.sops.yaml`, `tconnectsync.env.sops.yaml`, and
+   (optional) `backup.env.sops.yaml` from the `*.env.example` files.
+4. Fill in real values with `sudo -E scripts/secrets.sh edit <name>`.
+5. Commit the encrypted files and push.
+
+Reference for what goes in each: `config/nightscout.env.template`,
+`config/tconnectsync.env.template`.
+
+Key values:
+- `API_SECRET` — `openssl rand -hex 20`. Same plaintext string goes in
+  `tconnectsync` as `NS_SECRET`.
+- `CONNECT_SHARE_ACCOUNT_NAME` / `CONNECT_SHARE_PASSWORD` — the Dexcom account with an
+  **active follower** and a **non-phone-number** username.
+- `BASE_URL=https://beelink-ns.<tailnet>.ts.net`.
+- `PUMP_SERIAL_NUMBER` — the Mobi serial from the Tandem app / tandemsource.com.
+- `TZ` / `TIMEZONE_NAME` — identical, matching the host timezone.
+
+### 7. Start the service
+
+```bash
+sudo cp systemd/diabetes-stack.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable tconnectsync
-sudo systemctl start tconnectsync
+sudo systemctl enable --now diabetes-stack
+sudo tailscale serve --bg --https=443 127.0.0.1:1337
+sudo tailscale serve status         # -> https://beelink-ns.<tailnet>.ts.net
 ```
 
-## MongoDB Backup & Restore
+---
 
-### Setup AWS S3
-
-1. Create an S3 bucket for backups
-2. Configure AWS CLI: `aws configure`
-3. Copy and edit the backup config:
-   ```bash
-   cp config/backup.env.template config/backup.env
-   nano config/backup.env
-   ```
-
-### Create Backup
+## Verification
 
 ```bash
-# Local backup only
-./scripts/backup-mongodb.sh
+cd /opt/diabetes/config
 
-# Backup and upload to S3
-./scripts/backup-mongodb.sh --upload
+# 1. Mongo healthy
+docker compose ps
+docker exec nightscout-mongo mongo --quiet --eval 'db.adminCommand("ping")'   # { ok: 1 }
 
-# Backup, upload, and clean up old backups
-./scripts/backup-mongodb.sh --upload --cleanup
+# 2. Nightscout up
+docker compose logs -f nightscout        # "listening on port 1337", Mongo connected
+curl -s http://127.0.0.1:1337/api/v1/status.json | jq '.status, .settings.units'
+
+# 3. Reachable over Tailscale
+#    open https://beelink-ns.<tailnet>.ts.net on a tailnet device, log in with API_SECRET
+
+# 4. Dexcom Share feed (within ~10 min)
+curl -s 'http://127.0.0.1:1337/api/v1/entries.json?count=5' | jq '.[].device'   # nightscout-connect / share
+
+# 5. tconnectsync - first login may need interactive 2FA:
+docker compose run --rm -it tconnectsync --check-login
+docker compose logs -f tconnectsync
+curl -s 'http://127.0.0.1:1337/api/v1/treatments.json?count=10' | jq '.[].eventType'   # Temp Basal, Bolus, ...
+curl -s http://127.0.0.1:1337/api/v1/profile.json | jq '.[0].store'
+
+# 6. Reboot test
+sudo reboot
+#   after boot, with no manual steps:
+systemctl status diabetes-stack          # active (exited)
+ls -l /run/diabetes                       # nightscout.env / tconnectsync.env at 0600
+docker compose ps                         # all Up / healthy
+tailscale status                          # Online
+curl -s 'http://127.0.0.1:1337/api/v1/entries.json?count=2' | jq '.[].dateString'   # fresh
 ```
 
-### Restore from Backup
+---
+
+## Backups
+
+`scripts/backup-mongodb.sh --docker` runs `mongodump --archive --gzip` inside
+`nightscout-mongo`, writing to `backups/nightscout_<timestamp>.archive.gz`.
+
+`sudo crontab -e`:
+
+```cron
+15 3 * * *   /opt/diabetes/scripts/backup-mongodb.sh --docker >> /opt/diabetes/backups/backup.log 2>&1
+0 4 * * *    find /opt/diabetes/backups -name 'nightscout_*.archive.gz' -mtime +14 -delete
+30 3 * * 0   /opt/diabetes/scripts/backup-mongodb.sh --docker --upload --cleanup >> /opt/diabetes/backups/backup.log 2>&1
+```
+
+- **S3 offsite (optional):** put `S3_BUCKET`, `S3_PREFIX`, `AWS_*`, `BACKUP_RETENTION`
+  in `secrets/backup.env.sops.yaml`; use a dedicated IAM user scoped to that bucket.
+  Offsite alternative: `rsync` `backups/` to another tailnet host or NAS.
+- **Also back up** `~/.config/sops/age/keys.txt` (encrypted / in your password manager)
+  — without it the `*.sops.yaml` files are unrecoverable.
+- **Restore:** `./scripts/restore-mongodb.sh backups/<file>` (or `--from-s3 <name>`).
+  Do a drill into a scratch DB name once.
+
+Restore drill / DR is the only reason these exist — the historical data itself isn't
+precious.
+
+---
+
+## Rotating a secret
 
 ```bash
-# List available S3 backups
-./scripts/restore-mongodb.sh --list-s3
-
-# Restore from S3
-./scripts/restore-mongodb.sh --from-s3 nightscout_20240115_120000.archive.gz
-
-# Restore from local file
-./scripts/restore-mongodb.sh backups/nightscout_20240115_120000.archive.gz
+sudo -E scripts/secrets.sh edit nightscout      # change value, save (re-encrypts)
+git commit -am "Rotate Dexcom password" && git push
+sudo systemctl restart diabetes-stack           # re-decrypts, recreates containers
 ```
 
-### Scheduled Backups (Cron)
+---
 
-Add to crontab (`crontab -e`):
-```bash
-# Daily backup at 2 AM, upload to S3, keep last 30
-0 2 * * * /path/to/diabetes/scripts/backup-mongodb.sh --upload --cleanup >> /var/log/nightscout-backup.log 2>&1
-```
+## Later: Home Assistant / Airstream LEDs
 
-## Migration from AWS
+- Put the HA host on the same tailnet (Tailscale add-on for HA OS).
+- Add the **native `Nightscout` integration**: URL
+  `https://beelink-ns.<tailnet>.ts.net`, API key = a Nightscout access token (Admin
+  Tools → Subjects, role `readable`) or the `API_SECRET`. Gives `sensor.blood_glucose`
+  with `delta` + trend `direction`.
+- Automation: trigger on `sensor.blood_glucose`, `choose` on value bands, set the
+  Airstream light group colour (`<55` red+flash, `55–80` amber, `80–180` green,
+  `180–250` amber, `>250` magenta). No custom integration needed.
 
-To migrate your Nightscout data from an AWS-hosted server:
+---
 
-1. **On the AWS server:** Create a backup
-   ```bash
-   mongodump --db nightscout --archive=nightscout_migration.archive.gz --gzip
-   ```
+## Gotchas
 
-2. **Transfer to S3:**
-   ```bash
-   aws s3 cp nightscout_migration.archive.gz s3://your-bucket/nightscout-backups/
-   ```
-
-3. **On your new server:** Run setup and restore
-   ```bash
-   ./setup.sh
-   # Configure environment files
-   cd config && docker compose up -d
-   # Wait for MongoDB to start
-   sleep 10
-   cd ..
-   ./scripts/restore-mongodb.sh --from-s3 nightscout_migration.archive.gz
-   ```
-
-## Production Deployment
-
-### SSL/HTTPS with Traefik
-
-1. Edit `config/docker-compose.yml`:
-   - Update the Traefik host label with your domain
-   - Uncomment the Traefik service block
-   - Set your email for Let's Encrypt
-
-2. Ensure ports 80 and 443 are open on your firewall
-
-3. Point your domain's DNS to your server's IP
-
-4. Restart services:
-   ```bash
-   cd config
-   docker compose down
-   docker compose up -d
-   ```
-
-### Systemd Services
-
-For running services on boot without Docker:
-
-```bash
-# Install services
-sudo cp systemd/*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# Enable and start Nightscout
-sudo systemctl enable nightscout
-sudo systemctl start nightscout
-
-# Enable and start Tconnectsync
-sudo systemctl enable tconnectsync
-sudo systemctl start tconnectsync
-
-# Check status
-sudo systemctl status nightscout tconnectsync
-```
-
-## Troubleshooting
-
-### Nightscout won't start
-
-```bash
-# Check logs
-cd config && docker compose logs nightscout
-
-# Common issues:
-# - API_SECRET too short (needs 12+ chars)
-# - MongoDB not ready (wait and retry)
-# - Port 1337 already in use
-```
-
-### Tconnectsync authentication fails
-
-```bash
-# Test login
-tconnectsync --check-login
-
-# Common issues:
-# - Wrong credentials in tconnectsync.env
-# - Tandem Source password changed
-# - Region mismatch (US vs EU)
-```
-
-### MongoDB connection issues
-
-```bash
-# Check if MongoDB is running
-docker compose ps mongo
-
-# Check MongoDB logs
-docker compose logs mongo
-
-# Test connection
-docker exec nightscout-mongo mongo --eval "db.adminCommand('ping')"
-```
+| | |
+|---|---|
+| **Mongo + AVX** | `mongo:4.4` needs no AVX and is the safe choice for any Beelink CPU. MongoDB 5.0+ requires AVX — don't upgrade the image without checking `/proc/cpuinfo`. If 4.4 hits `Illegal instruction`, fall back to `mongo:4.2`. |
+| **Dexcom username** | Share feed fails silently if the account logs in with a phone number, or has no active follower. |
+| **tconnectsync first login** | Tandem Source may require OAuth + 2FA once — run `docker compose run --rm -it tconnectsync --check-login`; the token caches in the mounted volume. Re-run if it later 401s. |
+| **Tailscale key expiry** | Disable it for `beelink-ns` or the stack becomes unreachable in ~180 days. |
+| **age key loss** | = permanent secret loss. Back it up the moment you create it. |
+| **Double CGM feed** | Dexcom Share (`device: nightscout-connect`) and tconnectsync `CGM` (`device: tconnectsync`, ~30–60 min lag) both write `sgv`. Harmless; drop `CGM` from the `--features` list in `docker-compose.yml` if the lag artifacts annoy you. Never also enable the deprecated `bridge` plugin. |
+| **`latest` image tags** | `nightscout/cgm-remote-monitor:latest` and the tconnectsync image can shift on `docker compose pull`. Take a Mongo backup first; consider pinning. |
+| **`config/.env`** | Holds host paths only, no secrets, and is gitignored. |
 
 ## Resources
 
-- [Nightscout Documentation](https://nightscout.github.io/)
-- [Nightscout Ubuntu Setup Guide](https://nightscout.github.io/vendors/VPS/ubuntu/)
-- [Tconnectsync Repository](https://github.com/jwoglom/tconnectsync)
-- [MongoDB Documentation](https://docs.mongodb.com/)
-
-## License
-
-Personal configuration repository. The upstream projects (Nightscout, Tconnectsync) have their own licenses.
+- [Nightscout docs](https://nightscout.github.io/) ·
+  [setup variables](https://nightscout.github.io/nightscout/setup_variables/)
+- [tconnectsync](https://github.com/jwoglom/tconnectsync)
+- [SOPS](https://github.com/getsops/sops) · [age](https://github.com/FiloSottile/age)
+- [Tailscale Serve](https://tailscale.com/kb/1242/tailscale-serve)
+- [Home Assistant Nightscout integration](https://www.home-assistant.io/integrations/nightscout/)

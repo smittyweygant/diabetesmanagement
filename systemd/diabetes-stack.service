@@ -1,0 +1,40 @@
+# Diabetes stack service.
+#
+# Decrypts the SOPS secret files into a tmpfs, brings the Docker Compose stack up,
+# and shreds the plaintext on stop. Plaintext secrets never touch persistent disk.
+#
+# Install:
+#   sudo cp systemd/diabetes-stack.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now diabetes-stack
+#
+# Assumes the repo is at /opt/diabetes and the age key at
+# /root/.config/sops/age/keys.txt. Adjust paths below if not.
+
+[Unit]
+Description=Diabetes stack (Nightscout + tconnectsync + MongoDB)
+Requires=docker.service
+After=docker.service network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/diabetes/config
+Environment=SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt
+Environment=SECRETS_DIR=/run/diabetes
+
+# /run is tmpfs, so decrypted secrets live in RAM only.
+ExecStartPre=/usr/bin/install -d -m 0710 /run/diabetes
+ExecStartPre=/opt/diabetes/scripts/secrets.sh decrypt-all /run/diabetes
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+
+ExecStop=/usr/bin/docker compose down
+
+# Best-effort shred; /run/diabetes is also wiped on every reboot.
+ExecStopPost=/bin/sh -c 'shred -u /run/diabetes/*.env 2>/dev/null || true; rm -rf /run/diabetes'
+
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

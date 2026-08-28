@@ -28,9 +28,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BACKUP_DIR="${PROJECT_DIR}/backups"
 
-# Load environment from file if exists
-if [ -f "${PROJECT_DIR}/config/backup.env" ]; then
-    source "${PROJECT_DIR}/config/backup.env"
+# Load environment: decrypted secrets tmpfs first, legacy plaintext file second.
+SECRETS_DIR="${SECRETS_DIR:-/run/diabetes}"
+if [ -f "${SECRETS_DIR}/backup.env" ]; then
+    set -a; . "${SECRETS_DIR}/backup.env"; set +a
+elif [ -f "${PROJECT_DIR}/config/backup.env" ]; then
+    set -a; . "${PROJECT_DIR}/config/backup.env"; set +a
 fi
 
 # Defaults
@@ -231,9 +234,10 @@ if ! command -v mongorestore &> /dev/null; then
     if [ "$DOCKER_MODE" = true ] || command -v docker &> /dev/null; then
         log_info "Using mongorestore via Docker..."
         
-        # Get the container name
-        MONGO_CONTAINER=$(docker ps --filter "name=mongo" --format "{{.Names}}" | head -1)
-        
+        # Get the container name (this stack names it nightscout-mongo)
+        MONGO_CONTAINER=$(docker ps --filter "name=nightscout-mongo" --format "{{.Names}}" | head -1)
+        [ -n "$MONGO_CONTAINER" ] || MONGO_CONTAINER=$(docker ps --filter "name=mongo" --format "{{.Names}}" | head -1)
+
         if [ -z "$MONGO_CONTAINER" ]; then
             log_error "No MongoDB container found. Is it running?"
             exit 1

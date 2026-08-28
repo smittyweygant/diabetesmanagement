@@ -1,92 +1,101 @@
-# Docker Compose for Nightscout + MongoDB
-# 
-# Usage:
-#   1. Copy nightscout.env.template to nightscout.env and configure
-#   2. Run: docker compose up -d
-#   3. Access Nightscout at http://localhost:1337 (or via Traefik on 443)
+# Diabetes stack: MongoDB + Nightscout + tconnectsync
 #
-# For production with SSL, update the Traefik labels below.
+# One stack, one command:  docker compose up -d
+#
+# Secrets are NOT in this file and NOT in a plaintext .env. They live encrypted in
+# secrets/*.sops.yaml and are decrypted to a tmpfs (SECRETS_DIR, default /run/diabetes)
+# at service start by systemd/diabetes-stack.service. For local/dev bring-up you can
+# decrypt them there by hand first (see secrets/README.md).
+#
+# Non-secret interpolation vars come from config/.env (copy from config/.env.template):
+#   SECRETS_DIR, MONGO_DATA_DIR, TCONNECTSYNC_DATA_DIR
+#
+# Remote access is via Tailscale (`tailscale serve --bg --https=443 127.0.0.1:1337`),
+# so Nightscout is bound to loopback only and there is no reverse proxy in this file.
 
-version: '3.8'
+name: diabetes
 
 x-logging: &default-logging
-  options:
-    max-size: '10m'
-    max-file: '5'
   driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
 
 services:
   # ==========================================================================
-  # MongoDB Database
+  # MongoDB - Nightscout's datastore
   # ==========================================================================
   mongo:
     image: mongo:4.4
     container_name: nightscout-mongo
     restart: unless-stopped
+    # Small-box memory cap; raise if the Beelink has RAM to spare.
+    command: ["--wiredTigerCacheSizeGB", "0.5"]
     volumes:
-      - ${MONGO_DATA_DIR:-../mongo-data}:/data/db:cached
+      - ${MONGO_DATA_DIR:-./data/mongo}:/data/db
+    healthcheck:
+      test: ["CMD", "mongo", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     logging: *default-logging
-    # Uncomment to expose MongoDB port for external access/backup
-    # ports:
-    #   - "27017:27017"
 
   # ==========================================================================
-  # Nightscout Application
+  # Nightscout (cgm-remote-monitor)
   # ==========================================================================
   nightscout:
     image: nightscout/cgm-remote-monitor:latest
     container_name: nightscout
     restart: unless-stopped
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
     env_file:
-      - ./nightscout.env
+      - ${SECRETS_DIR:-/run/diabetes}/nightscout.env
     environment:
-      # Override for Docker networking
       MONGO_CONNECTION: mongodb://mongo:27017/nightscout
       NODE_ENV: production
+      INSECURE_USE_HTTP: "true"
     ports:
-      # Direct access without Traefik (for local/testing)
-      - "1337:1337"
-    labels:
-      # Traefik labels for production SSL (uncomment and configure)
-      - 'traefik.enable=true'
-      - 'traefik.http.routers.nightscout.rule=Host(`nightscout.example.com`)'
-      - 'traefik.http.routers.nightscout.entrypoints=websecure'
-      - 'traefik.http.routers.nightscout.tls.certresolver=le'
-      - 'traefik.http.services.nightscout.loadbalancer.server.port=1337'
+      # Loopback only. Tailscale Serve exposes it to the tailnet.
+      - "127.0.0.1:1337:1337"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:1337/api/v1/status.json',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
     logging: *default-logging
 
   # ==========================================================================
-  # Traefik Reverse Proxy (for SSL/HTTPS)
-  # Uncomment this section for production with automatic Let's Encrypt certs
+  # tconnectsync - Tandem Source (Mobi / t:slim X2) -> Nightscout
+  # Needs tconnectsync >= 2.0 for Tandem Source; the :latest image is fine.
   # ==========================================================================
-  # traefik:
-  #   image: traefik:latest
-  #   container_name: traefik
-  #   restart: unless-stopped
-  #   command:
-  #     - '--providers.docker=true'
-  #     - '--providers.docker.exposedbydefault=false'
-  #     - '--entrypoints.web.address=:80'
-  #     - '--entrypoints.web.http.redirections.entrypoint.to=websecure'
-  #     - '--entrypoints.websecure.address=:443'
-  #     - '--certificatesresolvers.le.acme.httpchallenge=true'
-  #     - '--certificatesresolvers.le.acme.httpchallenge.entrypoint=web'
-  #     - '--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json'
-  #     # UPDATE: Your email for Let's Encrypt notifications
-  #     - '--certificatesresolvers.le.acme.email=your-email@example.com'
-  #   ports:
-  #     - '80:80'
-  #     - '443:443'
-  #   volumes:
-  #     - '../letsencrypt:/letsencrypt'
-  #     - '/var/run/docker.sock:/var/run/docker.sock:ro'
-  #   logging: *default-logging
+  tconnectsync:
+    image: ghcr.io/jwoglom/tconnectsync/tconnectsync:latest
+    container_name: tconnectsync
+    restart: unless-stopped
+    depends_on:
+      nightscout:
+        condition: service_started
+    env_file:
+      - ${SECRETS_DIR:-/run/diabetes}/tconnectsync.env
+    # Features are selected here (not via env). CGM is included as a lagged backup
+    # copy of pump-ingested Dexcom data; the real-time feed is Nightscout's own
+    # Dexcom Share integration. Drop CGM here if the double feed is noisy.
+    command: ["--auto-update", "--features", "BASAL", "BOLUS", "PUMP_EVENTS", "PROFILES", "CGM"]
+    volumes:
+      # Persists the Tandem Source auth/token cache across restarts.
+      # Confirm the in-image home dir before trusting this path:
+      #   docker compose run --rm tconnectsync sh -c 'echo $HOME'
+      - ${TCONNECTSYNC_DATA_DIR:-./data/tconnectsync}:/root/.config/tconnectsync
+    logging: *default-logging
 
-# ==========================================================================
-# Networks (optional, for isolation)
-# ==========================================================================
 networks:
   default:
-    name: nightscout-network
+    name: diabetes-net

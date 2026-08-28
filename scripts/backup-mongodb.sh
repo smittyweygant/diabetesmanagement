@@ -30,9 +30,14 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BACKUP_DIR="${PROJECT_DIR}/backups"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-# Load environment from file if exists
-if [ -f "${PROJECT_DIR}/config/backup.env" ]; then
-    source "${PROJECT_DIR}/config/backup.env"
+# Load environment. Preference order:
+#   1. decrypted secrets tmpfs (what systemd/diabetes-stack.service produces)
+#   2. legacy plaintext config/backup.env (older setups)
+SECRETS_DIR="${SECRETS_DIR:-/run/diabetes}"
+if [ -f "${SECRETS_DIR}/backup.env" ]; then
+    set -a; . "${SECRETS_DIR}/backup.env"; set +a
+elif [ -f "${PROJECT_DIR}/config/backup.env" ]; then
+    set -a; . "${PROJECT_DIR}/config/backup.env"; set +a
 fi
 
 # Defaults
@@ -147,8 +152,9 @@ if ! command -v mongodump &> /dev/null; then
     if [ "${DOCKER_MODE:-false}" = true ] || command -v docker &> /dev/null; then
         log_info "Using mongodump from Docker container..."
         
-        # Get the container name
-        MONGO_CONTAINER=$(docker ps --filter "name=mongo" --format "{{.Names}}" | head -1)
+        # Get the container name (this stack names it nightscout-mongo)
+        MONGO_CONTAINER=$(docker ps --filter "name=nightscout-mongo" --format "{{.Names}}" | head -1)
+        [ -n "$MONGO_CONTAINER" ] || MONGO_CONTAINER=$(docker ps --filter "name=mongo" --format "{{.Names}}" | head -1)
         
         if [ -z "$MONGO_CONTAINER" ]; then
             log_error "No MongoDB container found. Is it running?"

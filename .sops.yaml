@@ -1,0 +1,19 @@
+# SOPS configuration.
+#
+# Every file matching the rule below is encrypted with the age recipient(s) listed.
+# Replace the placeholder recipient with THIS host's age public key before first use:
+#
+#   age-keygen -o ~/.config/sops/age/keys.txt          # once, on the Beelink
+#   age-keygen -y ~/.config/sops/age/keys.txt          # prints the public key (age1...)
+#   # paste it below, replacing age1PLACEHOLDER..., then commit this file
+#
+# To add a second recipient later (e.g. a laptop for editing), append another
+# age1... key separated by a comma and run:  scripts/secrets.sh rekey
+#
+# The age PRIVATE key (keys.txt) is never committed. Keep a copy in your password
+# manager - without it the encrypted files are unrecoverable.
+
+creation_rules:
+  - path_regex: secrets/[^/]+\.env\.sops\.yaml$
+    age: >-
+      age1PLACEHOLDERreplacewithhostpublickey000000000000000000000000000

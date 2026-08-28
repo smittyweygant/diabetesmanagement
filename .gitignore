@@ -1,16 +1,39 @@
-# Cloned upstream repositories (managed by setup.sh)
+# Cloned upstream repositories (no longer used - stack runs from images - kept for safety)
 cgm-remote-monitor/
 tconnectsync/
 
-# Environment files with secrets (use .env.template files as reference)
+# Plaintext environment files - NEVER commit. Real config lives in secrets/*.sops.yaml (encrypted).
 *.env
 !*.env.template
+!*.env.example
+*.env.backup
 
-# MongoDB data directory
+# Decrypted secrets land here at runtime (tmpfs on the host); never on disk in the repo
+/run/
+secrets/*.env
+secrets/plaintext/
+
+# age / SOPS private keys - the one bootstrap secret, host-only
+*.agekey
+*age*key*.txt
+keys.txt
+key.txt
+
+# History-redaction helper (local only, may contain leaked literals)
+scripts/redactions.txt
+
+# Compose interpolation values (no secrets, but host-specific)
+config/.env
+
+# Container data volumes
+data/
 mongo-data/
 
-# Let's Encrypt certificates
+# Let's Encrypt (unused with Tailscale, kept ignored for old checkouts)
 letsencrypt/
+
+# Captured remote host config - contains real secrets, never commit
+remote-config/
 
 # Python
 __pycache__/
