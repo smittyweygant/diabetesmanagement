@@ -7,8 +7,12 @@ Tandem Mobi closed loop.
 - **Real-time CGM:** Dexcom G7 → Dexcom Share → Nightscout's `connect` plugin.
 - **Pump data:** Tandem Mobi → Tandem Source → tconnectsync → Nightscout
   (basal, bolus, pump events, profiles, plus a lagged backup copy of pump CGM).
-- **Host:** a Beelink mini PC on the home LAN.
+- **Host:** a Beelink mini PC (Intel N150, Ubuntu 24.04) that also runs an OpenWRT
+  router VM and other Docker stacks (Frigate, Home Assistant, Mosquitto). This stack is
+  additive and isolated — its own compose project (`diabetes`) on a pinned bridge
+  network `172.29.0.0/24`.
 - **Remote access:** Tailscale only — no public ports, no domain, no Let's Encrypt.
+  The Beelink is already on the tailnet as `smitty-beelink.tail40c9b0.ts.net`.
 - **Secrets:** encrypted at rest with SOPS + age; decrypted to RAM (tmpfs) at service
   start. Nothing sensitive on disk except the age key.
 
@@ -58,63 +62,61 @@ between reboots.
 
 ---
 
+## This box also runs…
+
+The Beelink is not dedicated to this project. Verified state (2026-08-28):
+
+- **OpenWRT router VM** (`OpenWrt-Router`, libvirt/KVM, autostart). Its WAN NIC + Wi-Fi
+  are **PCI passthrough** (`vfio-pci`) — invisible to the host and to Docker. Its LAN is
+  a single virtio port on host bridge `br0` (`192.168.10.0/24`, flat, no other VLANs).
+  **The host's own internet path is through this VM**, so on a cold boot outbound
+  traffic fails for ~30–60 s until libvirt starts it (the stack's restart policy +
+  app retries absorb this; the unit has `After=libvirtd.service`).
+- **Other Docker stacks**: Frigate, wyze-bridge, Mosquitto, Home Assistant — on
+  `172.17.0.0/16` and `172.18.0.0/16`.
+
+This stack stays out of their way: separate compose project (`diabetes`), pinned
+network `diabetes-net` = `172.29.0.0/24`, Nightscout bound to `127.0.0.1:1337`. All
+`docker` / `docker compose` commands below need `sudo` until your user is added to the
+`docker` group (`sudo usermod -aG docker "$USER"` + re-login).
+
 ## Beelink setup
 
-Assumes fresh **Ubuntu Server 24.04 LTS**, wired ethernet. Run as a normal sudo user.
+Already satisfied on this box (verified 2026-08-28), **skip**: Ubuntu 24.04.4 LTS,
+timezone `America/Los_Angeles` + NTP, Docker 29.x + Compose v5, `docker.service`
+enabled, `unattended-upgrades`, git/curl/jq/openssl, and Tailscale (node
+`smitty-beelink`, tailnet `tail40c9b0.ts.net`, MagicDNS on). The N150 has AVX2, so
+`mongo:4.4` (and newer) run fine.
 
-### 1. Base OS
+### 1. Tailscale admin console (browser, one-time) — done 2026-08-28
 
-```bash
-sudo apt update && sudo apt full-upgrade -y && sudo reboot
-sudo timedatectl set-timezone America/Denver        # your home-base tz
-sudo timedatectl set-ntp true
-sudo apt install -y unattended-upgrades apt-listchanges age
-sudo dpkg-reconfigure -plow unattended-upgrades
-```
+- Machines → `smitty-beelink` → **Disable key expiry** ✅
+- DNS → **Enable HTTPS Certificates** ✅ (needed for `tailscale serve --https=443`)
 
-### 2. Docker
-
-```bash
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker "$USER"        # then log out / back in
-sudo systemctl enable --now docker
-docker compose version                 # must be v2.x
-```
-
-### 3. SOPS
+### 2. Install SOPS + age
 
 ```bash
+sudo apt update && sudo apt install -y age
 SOPS_VER=3.9.0
 curl -fsSLo /tmp/sops https://github.com/getsops/sops/releases/download/v${SOPS_VER}/sops-v${SOPS_VER}.linux.amd64
 sudo install -m 0755 /tmp/sops /usr/local/bin/sops
 ```
 
-### 4. Tailscale
-
-```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --ssh --hostname beelink-ns
-tailscale ip -4
-```
-
-In the Tailscale **admin console** for node `beelink-ns`:
-- **Disable key expiry** — otherwise the box silently drops off the tailnet in ~180 days.
-- Enable **MagicDNS** + **HTTPS certificates**.
-
-MagicDNS name will be `beelink-ns.<your-tailnet>.ts.net`.
-
-### 5. Clone + scaffold
+### 3. Clone + scaffold
 
 ```bash
 sudo mkdir -p /opt/diabetes && sudo chown "$USER":"$USER" /opt/diabetes
-git clone git@github.com:smittyweygant/diabetesmanagement.git /opt/diabetes
+git clone -b rebuild-beelink-tailscale git@github.com:smittyweygant/diabetesmanagement.git /opt/diabetes   # until merged to main
 cd /opt/diabetes
 ./setup.sh
-$EDITOR config/.env                     # set MONGO_DATA_DIR / TCONNECTSYNC_DATA_DIR to /opt/diabetes/data/...
-sudo chown -R 999:999 /opt/diabetes/data/mongo   # mongo container runs as uid 999
+$EDITOR config/.env       # SECRETS_DIR=/run/diabetes
+                          # MONGO_DATA_DIR=/opt/diabetes/data/mongo
+                          # TCONNECTSYNC_DATA_DIR=/opt/diabetes/data/tconnectsync
+mkdir -p data/mongo data/tconnectsync backups
+sudo chown -R 999:999 data/mongo    # mongo container runs as uid 999
 ```
 
-### 6. Secrets
+### 4. Secrets
 
 Follow **[`secrets/README.md`](secrets/README.md)** to:
 1. `age-keygen` the host key (and copy it into your password manager).
@@ -132,53 +134,62 @@ Key values:
   `tconnectsync` as `NS_SECRET`.
 - `CONNECT_SHARE_ACCOUNT_NAME` / `CONNECT_SHARE_PASSWORD` — the Dexcom account with an
   **active follower** and a **non-phone-number** username.
-- `BASE_URL=https://beelink-ns.<tailnet>.ts.net`.
+- `BASE_URL=https://smitty-beelink.tail40c9b0.ts.net` (HTTP variant:
+  `http://smitty-beelink.tail40c9b0.ts.net:1337`).
 - `PUMP_SERIAL_NUMBER` — the Mobi serial from the Tandem app / tandemsource.com.
-- `TZ` / `TIMEZONE_NAME` — identical, matching the host timezone.
+- `TZ` / `TIMEZONE_NAME` — both `America/Los_Angeles` (matches the host).
 
-### 7. Start the service
+### 5. Start the service
 
 ```bash
 sudo cp systemd/diabetes-stack.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now diabetes-stack
 sudo tailscale serve --bg --https=443 127.0.0.1:1337
-sudo tailscale serve status         # -> https://beelink-ns.<tailnet>.ts.net
+sudo tailscale serve status         # -> https://smitty-beelink.tail40c9b0.ts.net
 ```
+
+If you skipped the HTTPS-certs toggle, use `--http=80` instead and set `BASE_URL` to the
+`http://…ts.net` form (WireGuard already encrypts the transport).
 
 ---
 
 ## Verification
 
 ```bash
-cd /opt/diabetes/config
+cd /opt/diabetes/config     # (prefix docker commands with sudo until you're in the docker group)
 
-# 1. Mongo healthy
-docker compose ps
-docker exec nightscout-mongo mongo --quiet --eval 'db.adminCommand("ping")'   # { ok: 1 }
+# 1. Mongo healthy + network pinned
+sudo docker compose ps
+sudo docker network inspect diabetes-net -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}'   # 172.29.0.0/24
+sudo docker exec nightscout-mongo mongo --quiet --eval 'db.adminCommand("ping")'         # { ok: 1 }
 
 # 2. Nightscout up
-docker compose logs -f nightscout        # "listening on port 1337", Mongo connected
+sudo docker compose logs -f nightscout   # "listening on port 1337", Mongo connected
 curl -s http://127.0.0.1:1337/api/v1/status.json | jq '.status, .settings.units'
 
 # 3. Reachable over Tailscale
-#    open https://beelink-ns.<tailnet>.ts.net on a tailnet device, log in with API_SECRET
+#    open https://smitty-beelink.tail40c9b0.ts.net on a tailnet device, log in with API_SECRET
 
 # 4. Dexcom Share feed (within ~10 min)
 curl -s 'http://127.0.0.1:1337/api/v1/entries.json?count=5' | jq '.[].device'   # nightscout-connect / share
 
 # 5. tconnectsync - first login may need interactive 2FA:
-docker compose run --rm -it tconnectsync --check-login
-docker compose logs -f tconnectsync
+sudo docker compose run --rm -it tconnectsync --check-login
+sudo docker compose logs -f tconnectsync
 curl -s 'http://127.0.0.1:1337/api/v1/treatments.json?count=10' | jq '.[].eventType'   # Temp Basal, Bolus, ...
 curl -s http://127.0.0.1:1337/api/v1/profile.json | jq '.[0].store'
 
-# 6. Reboot test
+# 6. Neighbours undisturbed
+sudo docker ps --format '{{.Names}} {{.Status}}'   # frigate / homeassistant / wyze-bridge / mosquitto still Up
+sudo virsh domstate OpenWrt-Router                  # running
+
+# 7. Reboot test
 sudo reboot
 #   after boot, with no manual steps:
 systemctl status diabetes-stack          # active (exited)
 ls -l /run/diabetes                       # nightscout.env / tconnectsync.env at 0600
-docker compose ps                         # all Up / healthy
+sudo docker compose ps                    # all Up / healthy
 tailscale status                          # Online
 curl -s 'http://127.0.0.1:1337/api/v1/entries.json?count=2' | jq '.[].dateString'   # fresh
 ```
@@ -223,14 +234,18 @@ sudo systemctl restart diabetes-stack           # re-decrypts, recreates contain
 
 ## Later: Home Assistant / Airstream LEDs
 
-- Put the HA host on the same tailnet (Tailscale add-on for HA OS).
-- Add the **native `Nightscout` integration**: URL
-  `https://beelink-ns.<tailnet>.ts.net`, API key = a Nightscout access token (Admin
-  Tools → Subjects, role `readable`) or the `API_SECRET`. Gives `sensor.blood_glucose`
-  with `delta` + trend `direction`.
+Home Assistant **already runs on this Beelink** (container `homeassistant`), so no
+tailnet hop is needed between HA and Nightscout:
+
+- Attach `homeassistant` to `diabetes-net` (or a shared `proxy` network) and point the
+  **native `Nightscout` integration** at `http://nightscout:1337`. Otherwise use
+  `http://192.168.10.106:1337`.
+- API key = a Nightscout access token (Admin Tools → Subjects, role `readable`) or the
+  `API_SECRET`. Gives `sensor.blood_glucose` with `delta` + trend `direction`.
 - Automation: trigger on `sensor.blood_glucose`, `choose` on value bands, set the
   Airstream light group colour (`<55` red+flash, `55–80` amber, `80–180` green,
   `180–250` amber, `>250` magenta). No custom integration needed.
+- Do this after ~a week of stable operation.
 
 ---
 
@@ -238,13 +253,16 @@ sudo systemctl restart diabetes-stack           # re-decrypts, recreates contain
 
 | | |
 |---|---|
-| **Mongo + AVX** | `mongo:4.4` needs no AVX and is the safe choice for any Beelink CPU. MongoDB 5.0+ requires AVX — don't upgrade the image without checking `/proc/cpuinfo`. If 4.4 hits `Illegal instruction`, fall back to `mongo:4.2`. |
+| **Docker subnet** | `diabetes-net` is pinned to `172.29.0.0/24` (free on the host, clear of OpenWRT's `192.168.10.0/24` and the existing `172.17` / `172.18` Docker nets). Don't let it auto-allocate. |
+| **Cold boot** | The host's internet path is the OpenWRT VM. Containers may fail outbound for ~30–60 s after a reboot until libvirt starts it; `restart: unless-stopped` + app retries recover. Unit has `After=libvirtd.service`. |
 | **Dexcom username** | Share feed fails silently if the account logs in with a phone number, or has no active follower. |
-| **tconnectsync first login** | Tandem Source may require OAuth + 2FA once — run `docker compose run --rm -it tconnectsync --check-login`; the token caches in the mounted volume. Re-run if it later 401s. |
-| **Tailscale key expiry** | Disable it for `beelink-ns` or the stack becomes unreachable in ~180 days. |
-| **age key loss** | = permanent secret loss. Back it up the moment you create it. |
+| **tconnectsync first login** | Tandem Source may require OAuth + 2FA once — run `sudo docker compose run --rm -it tconnectsync --check-login`; the token caches in the mounted volume. Re-run if it later 401s. |
+| **Tailscale key expiry / HTTPS** | For `smitty-beelink`: key expiry disabled and tailnet HTTPS certs enabled 2026-08-28. If HTTPS were off, use `tailscale serve --http=80` and an `http://` `BASE_URL`. |
+| **age key loss** | = permanent secret loss. Back it up (1Password) the moment you create it. |
+| **docker group** | `smittyweygant` isn't in the `docker` group yet — use `sudo` for manual `docker` commands until `usermod -aG docker` + re-login. The systemd service runs as root and is unaffected. |
 | **Double CGM feed** | Dexcom Share (`device: nightscout-connect`) and tconnectsync `CGM` (`device: tconnectsync`, ~30–60 min lag) both write `sgv`. Harmless; drop `CGM` from the `--features` list in `docker-compose.yml` if the lag artifacts annoy you. Never also enable the deprecated `bridge` plugin. |
 | **`latest` image tags** | `nightscout/cgm-remote-monitor:latest` and the tconnectsync image can shift on `docker compose pull`. Take a Mongo backup first; consider pinning. |
+| **Mongo 4.4** | EOL for patches but matches Nightscout's tested driver and is fine for a private, loopback-only DB. The N150 has AVX2, so a newer Mongo would also run if you ever migrate. |
 | **`config/.env`** | Holds host paths only, no secrets, and is gitignored. |
 
 ## Resources

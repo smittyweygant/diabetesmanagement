@@ -14,7 +14,9 @@
 [Unit]
 Description=Diabetes stack (Nightscout + tconnectsync + MongoDB)
 Requires=docker.service
-After=docker.service network-online.target tailscaled.service
+# libvirtd: on this host the internet path is the OpenWRT router VM, so wait for
+# it (soft dependency - the stack still starts if the VM is down for maintenance).
+After=docker.service network-online.target tailscaled.service libvirtd.service
 Wants=network-online.target
 
 [Service]

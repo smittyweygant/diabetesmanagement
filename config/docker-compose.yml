@@ -29,8 +29,9 @@ services:
     image: mongo:4.4
     container_name: nightscout-mongo
     restart: unless-stopped
-    # Small-box memory cap; raise if the Beelink has RAM to spare.
-    command: ["--wiredTigerCacheSizeGB", "0.5"]
+    # Memory cap so Mongo doesn't balloon on a box shared with Frigate/HA/OpenWRT.
+    # The Beelink has 15 GiB; 1 GiB is plenty for this dataset. Raise if needed.
+    command: ["--wiredTigerCacheSizeGB", "1"]
     volumes:
       - ${MONGO_DATA_DIR:-./data/mongo}:/data/db
     healthcheck:
@@ -99,3 +100,9 @@ services:
 networks:
   default:
     name: diabetes-net
+    # Pinned to a subnet verified free on the Beelink host (which also runs an
+    # OpenWRT router VM on 192.168.10.0/24 and other Docker stacks on 172.17/172.18).
+    # Do not let this auto-allocate.
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
