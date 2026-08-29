@@ -15,5 +15,6 @@
 
 creation_rules:
   - path_regex: secrets/[^/]+\.env\.sops\.yaml$
+    # Beelink host key (smitty-beelink). Private key: /root/.config/sops/age/keys.txt + 1Password.
     age: >-
-      age1PLACEHOLDERreplacewithhostpublickey000000000000000000000000000
+      age1aghecdzdh68f2ejls8hqq0zup69u3a9dz9vheez7d6ucce42l33s2vwfhg

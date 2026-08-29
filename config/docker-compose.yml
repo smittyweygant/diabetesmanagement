@@ -62,11 +62,14 @@ services:
       # Loopback only. Tailscale Serve exposes it to the tailnet.
       - "127.0.0.1:1337:1337"
     healthcheck:
+      # Nightscout binds to the container hostname/IP (not localhost/0.0.0.0), so
+      # the check must target os.hostname(). Hit '/' (200) not /api/v1/status.json,
+      # which returns 401 under AUTH_DEFAULT_ROLES=denied. Any non-5xx = server up.
       test:
         - CMD
         - node
         - -e
-        - "require('http').get('http://localhost:1337/api/v1/status.json',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+        - "const o=require('os');require('http').get('http://'+o.hostname()+':1337/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
       interval: 30s
       timeout: 10s
       retries: 5
