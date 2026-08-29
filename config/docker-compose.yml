@@ -89,10 +89,11 @@ services:
         condition: service_started
     env_file:
       - ${SECRETS_DIR:-/run/diabetes}/tconnectsync.env
-    # Features are selected here (not via env). CGM is included as a lagged backup
-    # copy of pump-ingested Dexcom data; the real-time feed is Nightscout's own
-    # Dexcom Share integration. Drop CGM here if the double feed is noisy.
-    command: ["--auto-update", "--features", "BASAL", "BOLUS", "PUMP_EVENTS", "PROFILES", "CGM"]
+    # Features are selected here (not via env). CGM is intentionally NOT synced:
+    # the real-time glucose feed is Nightscout's own Dexcom Share integration
+    # (timezone-immune), and tconnectsync's CGM copy is lagged + gets mis-timed
+    # whenever the pump changes zones. tconnectsync here is insulin/basal/profile only.
+    command: ["--auto-update", "--features", "BASAL", "BOLUS", "PUMP_EVENTS", "PROFILES"]
     volumes:
       # Persists the Tandem Source auth/token cache across restarts.
       # Confirm the in-image home dir before trusting this path:
