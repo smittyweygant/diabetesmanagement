@@ -26,7 +26,10 @@ if [ ! -f "/usr/share/zoneinfo/$ZONE" ]; then
   exit 1
 fi
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve symlinks first — this script is symlinked as /usr/local/bin/diabetes-tz,
+# and BASH_SOURCE[0] would otherwise point at the symlink's directory.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO="$(cd "$(dirname "$SELF")/.." && pwd)"
 : "${SOPS_AGE_KEY_FILE:=/root/.config/sops/age/keys.txt}"
 export SOPS_AGE_KEY_FILE
 
@@ -51,8 +54,11 @@ plain="$(mktemp)"; enc="$(mktemp)"
 trap 'shred -u "$plain" "$enc" 2>/dev/null || rm -f "$plain" "$enc"' EXIT
 sops -d --output-type dotenv "$SECRET_FILE" > "$plain"
 sed -i "s#^TIMEZONE_NAME=.*#TIMEZONE_NAME=$ZONE#" "$plain"
-sops --encrypt --input-type dotenv --output-type yaml \
-  --age "$(grep -oE 'age1[0-9a-z]+' .sops.yaml | head -1)" "$plain" > "$enc"
+# --filename-override makes sops match .sops.yaml creation_rules against the
+# secrets/... path even though the actual input is a tmp file. In sops 3.9,
+# --age alone (without a rule match) errors with "no matching creation rules".
+sops --encrypt --filename-override "$SECRET_FILE" \
+  --input-type dotenv --output-type yaml "$plain" > "$enc"
 grep -q '^sops:' "$enc" || { echo "error: re-encryption did not produce a sops file; aborting" >&2; exit 1; }
 cat "$enc" > "$SECRET_FILE"
 
