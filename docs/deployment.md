@@ -1,160 +1,165 @@
-# Reference deployment — Beelink + OpenWRT + Tailscale
+# Reference deployment — Proxmox VM + Tailscale + Caddy
 
 This is how the maintainer actually runs `diabetes-stack`. It's a worked example, not a
-requirement — the stack only needs Docker, `sops`/`age`, and Tailscale. What makes this
-one interesting is that the host is **not dedicated**: it also runs the home router as a
-VM and several other Docker stacks, so the notes below are mostly about *coexistence*.
+requirement: the stack needs Docker, `sops`/`age`, Tailscale, and (for the custom name)
+a DNS zone Caddy can write to. The host is a general-purpose Docker VM that will also
+carry Plex and other services, so the stack keeps to its own pinned network and binds
+nothing to the LAN.
 
 ## The host
 
 | | |
 |---|---|
-| Hardware | Beelink mini-PC, Intel N150 (has AVX2), 15 GiB RAM, ~230 GiB SSD |
-| OS | Ubuntu 24.04 LTS, kernel 7.x |
+| Hypervisor | Proxmox VE 9.2 on the home server (`192.168.4.10`) |
+| Guest | VM 101 `docker-host`: Ubuntu 24.04 cloud image, 2 vCPU, 4 GiB RAM, 32 GiB disk on `local-lvm`, starts on host boot, QEMU guest agent on |
+| LAN address | `192.168.4.12/24` (static in the guest, reserved on the router's DHCP) |
 | Docker | Engine 29.x + Compose v5 |
-| Also hosting | an **OpenWRT router VM** (libvirt/KVM) and Docker stacks for Frigate, wyze-bridge, Mosquitto, and Home Assistant |
-| Repo path | `/opt/diabetes` |
-| Tailscale node | `smitty-beelink` on tailnet `tail40c9b0.ts.net`, MagicDNS on |
+| sops / age | sops 3.13 (`/usr/local/bin`), age 1.1 (apt) |
+| Repo path | `/opt/diabetes` (a git clone) |
+| Tailscale node | `docker-host` on tailnet `tail40c9b0.ts.net`, `100.65.38.92`, key expiry disabled |
+| Public name | `nightscout.smittoid.com` → A record `100.65.38.92` (Route 53) |
 
-## Network topology
+Grow RAM and disk as other stacks land on the VM (`qm set 101 --memory …`,
+`qm resize 101 scsi0 +…`).
 
-The Beelink **is** the home router — via a VM:
-
-```
-                 ┌─────────────────────── Beelink (Ubuntu host) ──────────────────────┐
-  Internet ──▶ [ I226-V NIC 02:00.0 ]  ──vfio-pci passthrough──▶  OpenWrt-Router VM    │
-             [ CNVi Wi-Fi 00:14.3 ]    ──vfio-pci passthrough──▶  (libvirt, autostart) │
-                                                                        │ virtio tap   │
-  Home LAN ◀──[ I226-V NIC 01:00.0 = enp1s0 ]──┬── br0 ────────────────┘              │
-                                               │   192.168.10.0/24                     │
-                                        host mgmt IP 192.168.10.106                    │
-                                        default route via 192.168.10.1 (OpenWRT LAN)   │
-                                                                                       │
-   Docker:  docker0 172.17/16 · camera-stack 172.18/16 · diabetes-net 172.29.0.0/24    │
-   Tailscale: tailscale0  100.113.28.48 / smitty-beelink.tail40c9b0.ts.net             │
-                 └───────────────────────────────────────────────────────────────────┘
-```
-
-Consequences for this stack:
-
-- **The host's own internet path is through the OpenWRT VM.** On a cold boot the host
-  has no connectivity until libvirt starts the VM (~30–60 s). `diabetes-stack.service`
-  has `After=libvirtd.service`, and `restart: unless-stopped` + Nightscout/tconnectsync
-  retries absorb the gap.
-- **The router's WAN NICs are PCI-passthrough** — invisible to the host kernel and to
-  Docker. The stack cannot touch the routing plane.
-- **`diabetes-net` is pinned to `172.29.0.0/24`** in `config/docker-compose.yml` rather
-  than letting Docker auto-allocate. The LAN OpenWRT serves is a flat `192.168.10.0/24`
-  (no other VLANs), and `172.17`/`172.18` are already taken by the other Docker stacks;
-  `172.29.0.0/24` is verified clear on the host. Pinning keeps a future `docker compose`
-  from wandering into a routed range.
-- **Nightscout is bound to `127.0.0.1:1337`** — not the LAN, not `0.0.0.0`. The only way
-  in is `tailscale serve` on the tailnet.
-
-## Remote access
-
-`tailscale serve` (not `funnel`) — tailnet-only, nothing public:
+## Network path
 
 ```
-https://smitty-beelink.tail40c9b0.ts.net/   →  proxy http://127.0.0.1:1337
+ phone / laptop / Home Assistant  (any tailnet device, anywhere)
+        │  https://nightscout.smittoid.com  → public DNS → 100.65.38.92 (tailnet-only)
+        ▼
+ docker-host  tailscale0 100.65.38.92
+        │  Caddy (host network) listens on 100.65.38.92:443 and :80 only
+        ▼
+ Nightscout  127.0.0.1:1337 (loopback publish)  ── diabetes-net 172.29.0.0/24 ──  mongo, tconnectsync
 ```
 
-Reachable from any device signed into the tailnet (phones, laptop are already members),
-from anywhere — home, cellular, the road. A device without Tailscale gets nothing.
-Home Assistant runs on this same box, so HA→Nightscout needs no tailnet hop.
-
-One-time in the Tailscale admin console for `smitty-beelink` (done 2026-08-28):
-
-- Machines → **Disable key expiry** (else the node drops off the tailnet in ~6 months)
-- DNS → **Enable HTTPS Certificates** (required for `serve --https=443`; otherwise use
-  `serve --http=80` and an `http://` `BASE_URL`)
+- **Tailnet-only, by binding, not by firewall.** Caddy binds the tailnet IP
+  (`default_bind` in `config/caddy/Caddyfile`) and Nightscout publishes on loopback.
+  `192.168.4.12:443` and `:1337` refuse connections.
+- **Public DNS, private address.** Anyone can resolve the name; only tailnet devices
+  can reach `100.65.38.92`.
+- **TLS is Let's Encrypt via Route 53 DNS-01.** Let's Encrypt can't reach the site, so
+  Caddy proves ownership with a TXT record. The IAM user `caddy-route53-nightscout` may
+  write only `_acme-challenge.nightscout.smittoid.com` TXT; its key is
+  `secrets/caddy.env.sops.yaml` (and 1Password). Certs persist in `data/caddy`.
+- **`diabetes-net` stays pinned to `172.29.0.0/24`** so later stacks on this VM can't
+  collide with it.
 
 ## Provisioning steps run
 
-Base OS, timezone (`America/Los_Angeles` — the box lives in California), NTP, Docker,
-`unattended-upgrades`, and Tailscale were already in place from other projects. What was
-added for this stack:
-
 ```bash
-# 1. sops + age  (age is in apt; sops is a release binary)
-sudo apt install -y age
-SOPS_VER=3.9.0
-curl -fsSLo /tmp/sops https://github.com/getsops/sops/releases/download/v${SOPS_VER}/sops-v${SOPS_VER}.linux.amd64
-sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+# --- on the Proxmox host: VM from the Ubuntu cloud image --------------------------
+cd /var/lib/vz/template/iso
+wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img  # check SHA256SUMS
+qm create 101 --name docker-host --ostype l26 --cpu host --cores 2 --memory 4096 \
+  --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-single \
+  --scsi0 local-lvm:0,import-from=$PWD/noble-server-cloudimg-amd64.img,discard=on,ssd=1,iothread=1 \
+  --ide2 local-lvm:cloudinit --boot order=scsi0 --serial0 socket --vga serial0 \
+  --agent enabled=1 --onboot 1
+qm resize 101 scsi0 32G
+qm set 101 --ciuser <user> --sshkeys <pubkey-file> \
+  --ipconfig0 ip=192.168.4.12/24,gw=192.168.4.1 --nameserver 8.8.8.8 --ciupgrade 1
+qm start 101
 
-# 2. repo + scaffold
+# --- in the guest ---------------------------------------------------------------
+sudo apt install -y qemu-guest-agent age git
+# Docker Engine + compose plugin from download.docker.com (apt repo)
+# sops: release binary sops-vX.Y.Z.linux.amd64, checked against sops-vX.Y.Z.checksums.txt
+sudo install -m 0755 sops-vX.Y.Z.linux.amd64 /usr/local/bin/sops
+# Tailscale from pkgs.tailscale.com, then:
+sudo tailscale up --hostname=docker-host      # approve; disable key expiry in admin console
+
 sudo mkdir -p /opt/diabetes && sudo chown "$USER":"$USER" /opt/diabetes
-git clone <repo> /opt/diabetes
-cd /opt/diabetes && ./setup.sh
-cp config/.env.template config/.env          # SECRETS_DIR=/run/diabetes,
-                                             # MONGO_DATA_DIR=/opt/diabetes/data/mongo,
-                                             # TCONNECTSYNC_DATA_DIR=/opt/diabetes/data/tconnectsync
-mkdir -p data/mongo data/tconnectsync backups
+git clone https://github.com/smittyweygant/diabetesmanagement.git /opt/diabetes
+cd /opt/diabetes
+cp config/.env.template config/.env
+mkdir -p data/mongo data/tconnectsync data/caddy backups
 sudo chown -R 999:999 data/mongo
 
-# 3. age key  (root, since the service runs as root)
-sudo mkdir -p /root/.config/sops/age
-sudo sh -c 'umask 077; age-keygen -o /root/.config/sops/age/keys.txt'
-sudo age-keygen -y /root/.config/sops/age/keys.txt      # public key -> .sops.yaml
-#   >>> private key -> 1Password <<<
+# age key: the existing private key from 1Password ("Age Key - Beelink"), not a new one
+sudo install -d -m 0700 /root/.config/sops/age
+sudo sh -c 'umask 077; cat > /root/.config/sops/age/keys.txt'     # paste, Ctrl-D
+sudo age-keygen -y /root/.config/sops/age/keys.txt                # must match .sops.yaml
 
-# 4. encrypted secrets  (see secrets/README.md)
-#     create secrets/{nightscout,tconnectsync,backup}.env.sops.yaml from the *.env.example
-#     files, fill in real values, git commit the ciphertext
+# build Caddy first: the build (~2 min) can outlast the unit's start timeout
+cd config && sudo SECRETS_DIR=/run/diabetes docker compose build caddy && cd ..
 
-# 5. service + serve
-sudo cp systemd/diabetes-stack.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now diabetes-stack
-sudo tailscale serve --bg --https=443 127.0.0.1:1337
-
-# 6. timezone helper on PATH
+sudo cp systemd/diabetes-stack.service systemd/diabetes-backup.service \
+        systemd/diabetes-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now diabetes-stack diabetes-backup.timer
 sudo ln -sfn /opt/diabetes/scripts/set-timezone.sh /usr/local/bin/diabetes-tz
-
-# 7. backup cron
-sudo crontab -e   # see README "Backups"
 ```
+
+Moving data from an old host: `mongodump --archive --gzip` there, copy the file over
+with `scp`, `mongorestore --archive --gzip` into the new `nightscout-mongo` before
+starting Nightscout. Dexcom Share refills the last 24 h of glucose by itself; refill pump
+data with one-shot tconnectsync runs (below).
 
 ## Verification (this host)
 
 ```bash
 cd /opt/diabetes/config
-SECRET=$(sudo grep '^API_SECRET=' /run/diabetes/nightscout.env | cut -d= -f2)
-HASH=$(printf %s "$SECRET" | sha1sum | cut -d' ' -f1)
-
 sudo systemctl status diabetes-stack                       # active (exited)
-ls -l /run/diabetes                                        # *.env @ 0600 root:root
-sudo docker compose ps                                     # mongo/nightscout healthy, tconnectsync up
-sudo docker network inspect diabetes-net -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}'   # 172.29.0.0/24
+sudo docker compose ps                                     # mongo/nightscout healthy; tconnectsync, caddy up
+sudo ss -tlnp | grep -E ':(443|80|1337) '                  # 100.65.38.92:443/:80 caddy, 127.0.0.1:1337 only
+systemctl list-timers diabetes-backup.timer                # next run ~03:30 Pacific
 
-curl -s -H "api-secret: $HASH" http://127.0.0.1:1337/api/v1/status.json | jq .status
-curl -s -H "api-secret: $HASH" 'http://127.0.0.1:1337/api/v1/entries.json?count=3' | jq '.[].device'
-curl -s -H "api-secret: $HASH" 'http://127.0.0.1:1337/api/v1/treatments.json?count=5' | jq '.[].eventType'
-
-# neighbours undisturbed
-sudo docker ps --format '{{.Names}} {{.Status}}'          # frigate / homeassistant / wyze-bridge / mosquitto
-sudo virsh domstate OpenWrt-Router                        # running
-
-# from a tailnet device: open https://smitty-beelink.tail40c9b0.ts.net/ and log in with API_SECRET
+# from a tailnet device
+curl -sI https://nightscout.smittoid.com/ | head -1         # HTTP/2 200, valid cert
+curl -s -o /dev/null -w '%{http_code}\n' https://nightscout.smittoid.com/api/v1/status.json   # 401 without a token
+# from the LAN, not on the tailnet: https://192.168.4.12/ must be refused
 ```
+
+A reboot test (`sudo systemctl reboot`) brings everything back unattended: the VM is up
+in ~30 s and all four containers within ~11 s of boot. If Caddy starts before
+`tailscaled` has the IP, its bind fails and `restart: unless-stopped` retries.
+
+## Backups
+
+`diabetes-backup.timer` runs `scripts/backup-mongodb.sh` nightly at 03:30
+**America/Los_Angeles** and keeps 30 days in `/opt/diabetes/backups` (0600 root). These
+sit on the VM's own disk: they protect against bad data, not a lost VM. Off-host copies
+(S3 `--upload`, or Proxmox `vzdump` to a backup drive) are still to do.
+
+## Manual pump backfill
+
+If Tandem Source ingestion had a gap, run tconnectsync once over an explicit window.
+Keep windows **≤ 2 days** and check per-day counts afterwards: a wide window can come
+back nearly empty without an error once the live `--auto-update` pass has already
+uploaded newer events. Nightscout dedupes on `pump_event_id`, so overlap is safe.
+
+```bash
+sudo docker run --rm --network diabetes-net --env-file /run/diabetes/tconnectsync.env \
+  -v /opt/diabetes/data/tconnectsync:/root/.config/tconnectsync \
+  ghcr.io/jwoglom/tconnectsync/tconnectsync:latest \
+  --features BASAL BOLUS PUMP_EVENTS PROFILES \
+  --start-date 2026-11-19T00:00:00 --end-date 2026-11-21T00:00:00
+```
+
+Dexcom Share keeps only the last 24 h of glucose; anything older lives only in Dexcom
+Clarity.
 
 ## Host-specific gotchas
 
 | | |
 |---|---|
-| **Reboot test** | `sudo reboot` bounces the **whole box** — the OpenWRT router and the camera stack included. Do it deliberately, not casually. After boot everything should return with no manual steps: `systemctl status diabetes-stack`, `docker compose ps`, `tailscale status`, and the `serve` config all persist. |
-| **docker group** | The login user isn't in `docker` — manual `docker` commands need `sudo` until `sudo usermod -aG docker "$USER"` + re-login. The systemd service runs as root regardless. |
-| **Cold boot connectivity** | See topology — internet comes up only after the OpenWRT VM does. |
-| **`nightscout-connect` password in logs** | v0.0.12 logs `sharePassword` on every start; scrub the container json-log if it matters (`sed -i` on `docker inspect --format '{{.LogPath}}'`). |
-| **Backup cron time** | Runs at 03:xx **Pacific** (host clock), regardless of where the pump/traveller currently is. |
+| **DNS rebind protection** | Some routers (OpenWRT/dnsmasq `rebind_protection`) drop public answers that point at private or CGNAT addresses, so `nightscout.smittoid.com` doesn't resolve on that LAN. Whitelist the domain: `uci add_list dhcp.@dnsmasq[0].rebind_domain='smittoid.com'`. |
+| **docker group** | The login user isn't in `docker`; manual `docker` commands need `sudo`. The systemd units run as root regardless. |
+| **tconnectsync 401s** | One `HTTP 401` warning per hour is normal: the Tandem token expires and tconnectsync logs in again. Repeated tracebacks and restarts are not normal. |
+| **Duplicate glucose entries** | `nightscout-connect` sometimes stores one Share reading twice, milliseconds apart. Seen on the old host too; cosmetic. |
+| **`nightscout-connect` password in logs** | It logs `sharePassword` on start; scrub the container json-log if that matters. |
+| **sops as root in `/tmp`** | Ubuntu's `fs.protected_regular` stops root writing a user-owned file in `/tmp`. Do `sops set`/`edit` on copies in a home directory. |
 
 ## Timezone, on the road
 
-The maintainer travels (Airstream). The pump follows the traveller; the Beelink stays in
-California. Only `TIMEZONE_NAME` (tconnectsync) needs updating on zone changes:
+The pump follows the traveller; the server stays home. Only `TIMEZONE_NAME`
+(tconnectsync) needs updating on zone changes:
 
 ```bash
-ssh smitty-beelink 'diabetes-tz America/Chicago'      # then commit the re-encrypted secret
+ssh docker-host 'sudo diabetes-tz America/Chicago'    # then commit the re-encrypted secret
 ```
 
-Nightscout `TZ` stays `America/Los_Angeles` (home); the live chart follows the viewing
-device anyway. Dexcom/`nightscout-connect` is UTC and needs nothing.
+Nightscout `TZ` stays `America/Los_Angeles`; the live chart follows the viewing device.
+Dexcom/`nightscout-connect` is UTC and needs nothing.

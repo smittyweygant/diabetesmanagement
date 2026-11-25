@@ -8,8 +8,8 @@
 # The Dexcom Share CGM feed is timezone-immune and needs no adjustment. This only
 # affects how tconnectsync's insulin/basal/profile timestamps are interpreted.
 #
-# Installed as `diabetes-tz` on the Beelink; run from anywhere on the tailnet:
-#   ssh smitty-beelink 'diabetes-tz America/Chicago'
+# Installed as `diabetes-tz` on the host; run from anywhere on the tailnet:
+#   ssh docker-host 'sudo diabetes-tz America/Chicago'
 #
 # Requires root (reads the age key, restarts the service).
 
