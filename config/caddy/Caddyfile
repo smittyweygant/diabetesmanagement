@@ -1,0 +1,23 @@
+# TLS front door for Nightscout at https://nightscout.smittoid.com.
+#
+# The name resolves (public DNS) to docker-host's tailnet IP, and Caddy listens only
+# on that IP, so the site is reachable from the tailnet and nowhere else: not the LAN,
+# not the internet. Caddy runs with host networking so it can bind the tailnet IP and
+# reach Nightscout on its loopback-only port.
+#
+# Route 53 credentials come from the environment (AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY, decrypted from secrets/caddy.env.sops.yaml). That IAM user
+# may write only the _acme-challenge TXT record for this name.
+
+{
+	default_bind 100.65.38.92
+}
+
+nightscout.smittoid.com {
+	tls {
+		dns route53 {
+			hosted_zone_id ZSLGL478SAT8E
+		}
+	}
+	reverse_proxy 127.0.0.1:1337
+}

@@ -1,4 +1,4 @@
-# Diabetes stack: MongoDB + Nightscout + tconnectsync
+# Diabetes stack: MongoDB + Nightscout + tconnectsync + Caddy
 #
 # One stack, one command:  docker compose up -d
 #
@@ -8,10 +8,11 @@
 # decrypt them there by hand first (see secrets/README.md).
 #
 # Non-secret interpolation vars come from config/.env (copy from config/.env.template):
-#   SECRETS_DIR, MONGO_DATA_DIR, TCONNECTSYNC_DATA_DIR
+#   SECRETS_DIR, MONGO_DATA_DIR, TCONNECTSYNC_DATA_DIR, CADDY_DATA_DIR
 #
-# Remote access is via Tailscale (`tailscale serve --bg --https=443 127.0.0.1:1337`),
-# so Nightscout is bound to loopback only and there is no reverse proxy in this file.
+# Remote access is https://nightscout.smittoid.com, tailnet-only: the name resolves to
+# the host's Tailscale IP and Caddy (below) listens only there. Nightscout itself is
+# bound to loopback.
 
 name: diabetes
 
@@ -99,6 +100,29 @@ services:
       # Confirm the in-image home dir before trusting this path:
       #   docker compose run --rm tconnectsync sh -c 'echo $HOME'
       - ${TCONNECTSYNC_DATA_DIR:-./data/tconnectsync}:/root/.config/tconnectsync
+    logging: *default-logging
+
+  # ==========================================================================
+  # Caddy - TLS for nightscout.smittoid.com (Let's Encrypt via Route 53 DNS-01)
+  # ==========================================================================
+  caddy:
+    build: ./caddy
+    image: diabetes-caddy:2.11.9-route53
+    container_name: caddy
+    restart: unless-stopped
+    # Host networking so Caddy can bind the Tailscale IP and reach Nightscout on
+    # 127.0.0.1:1337. If tailscaled isn't up yet at boot, the bind fails and the
+    # restart policy retries until it is.
+    network_mode: host
+    depends_on:
+      nightscout:
+        condition: service_started
+    env_file:
+      - ${SECRETS_DIR:-/run/diabetes}/caddy.env
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account. Keep it, or every restart re-issues.
+      - ${CADDY_DATA_DIR:-./data/caddy}:/data
     logging: *default-logging
 
 networks:
