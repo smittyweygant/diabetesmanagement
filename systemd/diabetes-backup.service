@@ -1,0 +1,26 @@
+# Nightly local MongoDB dump of the Nightscout database.
+#
+# Writes /opt/diabetes/backups/nightscout_<timestamp>.archive.gz via
+# scripts/backup-mongodb.sh (mongodump inside the running nightscout-mongo
+# container) and keeps 30 days of them. Local only: these live on the same disk as
+# the database, so they guard against bad data or a bad restore, not a lost VM.
+# Copy them off-host for that (S3 via --upload, or host-level backups).
+#
+# Install (with the timer):
+#   sudo cp systemd/diabetes-backup.service systemd/diabetes-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now diabetes-backup.timer
+# Run once by hand:  sudo systemctl start diabetes-backup.service
+
+[Unit]
+Description=Nightscout MongoDB backup (local)
+Requires=diabetes-stack.service
+After=diabetes-stack.service
+
+[Service]
+Type=oneshot
+# Backups hold health data; keep them owner-only.
+UMask=0077
+Environment=SECRETS_DIR=/run/diabetes
+ExecStart=/opt/diabetes/scripts/backup-mongodb.sh
+ExecStartPost=/usr/bin/find /opt/diabetes/backups -name 'nightscout_*.archive.gz' -mtime +30 -delete

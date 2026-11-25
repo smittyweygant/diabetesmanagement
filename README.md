@@ -17,8 +17,8 @@ any Dexcom (via Dexcom Share) and any Tandem pump tconnectsync supports.
 - **Secrets:** [SOPS](https://github.com/getsops/sops) + [age](https://github.com/FiloSottile/age),
   encrypted in the repo, decrypted to a tmpfs at service start, shredded on stop.
 
-> Running this on real hardware? A full worked example — a multi-tenant mini-PC that
-> also hosts a router VM — is in **[`docs/deployment.md`](docs/deployment.md)**.
+> Running this on real hardware? A full worked example — an Ubuntu VM on Proxmox,
+> served at a custom name over Tailscale — is in **[`docs/deployment.md`](docs/deployment.md)**.
 
 ## How it fits together
 
@@ -27,7 +27,7 @@ Dexcom app ──Share──► Nightscout `connect` plugin ─┐
                                                    ├─► MongoDB ─► Nightscout web UI
 Tandem pump ─► Tandem Source ─► tconnectsync ──────┘        (bound to 127.0.0.1:1337)
                                                                    │
-                                        Tailscale Serve (HTTPS, tailnet-only)
+                                  Caddy on the Tailscale IP (HTTPS, tailnet-only)
                                                                    │
                                               phone / laptop / Home Assistant
 ```
@@ -67,8 +67,10 @@ diabetes-stack/
 
 - Docker Engine + Compose v2
 - `sops` and `age`
-- Tailscale (the host on a tailnet; MagicDNS + HTTPS certs enabled for
-  `tailscale serve --https`)
+- Tailscale (the host on a tailnet)
+- A DNS name you control, with an A record pointing at the host's Tailscale IP, and
+  API access to its zone for Caddy's Let's Encrypt DNS-01 challenge (the build here
+  uses Route 53; other providers need a different `caddy-dns` module)
 - `git`, `curl`, `openssl`
 
 ## Configuration
@@ -79,7 +81,9 @@ Nothing sensitive is edited in place. Every value is documented in the
 
 | Where | What |
 |---|---|
-| `config/.env` | non-secret compose interpolation — `SECRETS_DIR`, `MONGO_DATA_DIR`, `TCONNECTSYNC_DATA_DIR`. Copied from `.env.template`, gitignored. |
+| `config/.env` | non-secret compose interpolation — `SECRETS_DIR`, `MONGO_DATA_DIR`, `TCONNECTSYNC_DATA_DIR`, `CADDY_DATA_DIR`. Copied from `.env.template`, gitignored. |
+| `config/caddy/Caddyfile` | site name, Tailscale IP to bind, Route 53 hosted zone ID |
+| `secrets/caddy.env.sops.yaml` | Route 53 key for the DNS-01 challenge (an IAM user limited to the `_acme-challenge` TXT record) |
 | `secrets/nightscout.env.sops.yaml` | `API_SECRET`, Dexcom Share account + password, `BASE_URL`, `TZ`, plugin/alarm settings |
 | `secrets/tconnectsync.env.sops.yaml` | Tandem Source login, `PUMP_SERIAL_NUMBER`, `TIMEZONE_NAME`, `NS_URL`, `NS_SECRET` |
 | `secrets/backup.env.sops.yaml` | S3 bucket + IAM keys (only if you use offsite backups) |
@@ -92,9 +96,8 @@ Key points:
   account (the one the phone paired to the sensor logs in with), **not** a follower
   account, and not a phone-number login. Share must be on with an accepted follower.
 - `NS_URL=http://nightscout:1337` — container-to-container on the compose network, so
-  it works even if `tailscale serve` is down.
-- `BASE_URL` — your `https://<host>.<tailnet>.ts.net` (or `http://<host>.<tailnet>.ts.net:1337`
-  if you serve plain HTTP).
+  it works even if Caddy is down.
+- `BASE_URL` — the site name Caddy serves, e.g. `https://nightscout.example.com`.
 
 See **[`secrets/README.md`](secrets/README.md)** for the age-key / encrypt / edit / rekey
 flow.
@@ -104,22 +107,31 @@ flow.
 ```bash
 # 1. prerequisites installed (see Requirements), repo cloned to e.g. /opt/diabetes
 ./setup.sh
-cp config/.env.template config/.env        # set the three paths for your host
-mkdir -p data/mongo data/tconnectsync backups
+cp config/.env.template config/.env        # set the paths for your host
+mkdir -p data/mongo data/tconnectsync data/caddy backups
 sudo chown -R 999:999 data/mongo           # the mongo container runs as uid 999
 
 # 2. secrets  (details: secrets/README.md)
 #    - age-keygen the host key, back it up, put the PUBLIC key in .sops.yaml
 #    - create + fill secrets/*.env.sops.yaml from the *.env.example files
 
-# 3. service
-sudo cp systemd/diabetes-stack.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now diabetes-stack
+# 3. TLS front door
+#    - edit config/caddy/Caddyfile: site name, Tailscale IP, hosted zone ID
+#    - DNS: A record <name> -> the host's Tailscale IP
+#    - build Caddy once up front (~2 min; longer than the unit's start timeout)
+(cd config && sudo SECRETS_DIR=/run/diabetes docker compose build caddy)
 
-# 4. publish to the tailnet
-sudo tailscale serve --bg --https=443 127.0.0.1:1337
-#    -> https://<host>.<tailnet>.ts.net
+# 4. services
+sudo cp systemd/diabetes-stack.service systemd/diabetes-backup.service \
+        systemd/diabetes-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now diabetes-stack diabetes-backup.timer
+#    -> https://<name>, reachable from the tailnet only
 ```
+
+No custom domain? Delete the `caddy` service from `config/docker-compose.yml` and
+publish with `sudo tailscale serve --bg --https=443 127.0.0.1:1337` instead; `BASE_URL`
+is then `https://<host>.<tailnet>.ts.net`.
 
 Verify:
 
@@ -168,17 +180,14 @@ already covers real-time glucose.
 
 ## Backups
 
-`scripts/backup-mongodb.sh --docker` runs `mongodump --archive --gzip` inside the mongo
-container into `backups/`.
-
-```cron
-15 3 * * *   /opt/diabetes/scripts/backup-mongodb.sh --docker >> /opt/diabetes/backups/backup.log 2>&1
-0 4 * * *    find /opt/diabetes/backups -name 'nightscout_*.archive.gz' -mtime +14 -delete
-30 3 * * 0   /opt/diabetes/scripts/backup-mongodb.sh --docker --upload --cleanup >> /opt/diabetes/backups/backup.log 2>&1
-```
+`scripts/backup-mongodb.sh` runs `mongodump --archive --gzip` inside the mongo
+container into `backups/`. `systemd/diabetes-backup.timer` runs it nightly at 03:30
+Pacific and keeps 30 days, owner-only (`journalctl -u diabetes-backup` for the log).
+Those copies share a disk with the database; copy them off the host too.
 
 - **S3 (optional):** put `S3_BUCKET` / `S3_PREFIX` / `AWS_*` / `BACKUP_RETENTION` in
-  `secrets/backup.env.sops.yaml`; use a dedicated IAM user scoped to that bucket.
+  `secrets/backup.env.sops.yaml`; use a dedicated IAM user scoped to that bucket, and
+  run the script with `--upload --cleanup`.
 - **Back up `~/.config/sops/age/keys.txt`** (in a password manager) — without it the
   `*.sops.yaml` files are unrecoverable.
 - **Restore:** `./scripts/restore-mongodb.sh backups/<file>` (or `--from-s3 <name>`).

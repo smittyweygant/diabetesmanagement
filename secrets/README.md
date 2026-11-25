@@ -19,7 +19,7 @@ The `*.sops.yaml` files store values as ciphertext; keys and structure stay read
 which is fine. Losing the age private key means the encrypted files are unrecoverable,
 so back it up the moment you create it.
 
-## First-time setup (on the Beelink)
+## First-time setup (on the host)
 
 ```bash
 # 1. install tools

@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Nightscout MongoDB backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 America/Los_Angeles
+RandomizedDelaySec=15m
+# Run a missed backup at next boot if the VM was off at 03:30.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

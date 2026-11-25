@@ -71,11 +71,12 @@ grep -q 'age1PLACEHOLDER' .sops.yaml 2>/dev/null && \
 
 echo
 echo "Next steps:"
-echo "  1. Provision the host and Tailscale        -> README.md section 'Beelink setup'"
+echo "  1. Provision the host and Tailscale        -> docs/deployment.md"
 echo "  2. Create + fill encrypted secrets         -> secrets/README.md"
-echo "  3. sudo cp systemd/diabetes-stack.service /etc/systemd/system/"
-echo "     sudo systemctl daemon-reload && sudo systemctl enable --now diabetes-stack"
-echo "  4. sudo tailscale serve --bg --https=443 127.0.0.1:1337"
+echo "  3. Edit config/caddy/Caddyfile, point DNS at the Tailscale IP, then build:"
+echo "     (cd config && sudo SECRETS_DIR=/run/diabetes docker compose build caddy)"
+echo "  4. sudo cp systemd/diabetes-{stack,backup}.service systemd/diabetes-backup.timer /etc/systemd/system/"
+echo "     sudo systemctl daemon-reload && sudo systemctl enable --now diabetes-stack diabetes-backup.timer"
 echo "  5. Verify                                  -> README.md section 'Verification'"
 echo
 
